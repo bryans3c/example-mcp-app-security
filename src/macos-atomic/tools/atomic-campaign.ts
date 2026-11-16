@@ -623,10 +623,18 @@ export function createAtomicCampaignStore(
         const routed = campaignEntry(test);
         const old = previous.get(test.test_guid);
         if (!old) throw new Error(`Campaign entry ${test.test_guid} is missing`);
+        // Reopen a compatibility result only when its executable route or
+        // approval semantics changed. Metadata-only normalization (for
+        // example, correcting desktop_operator's target_profile) must not
+        // revive a faithfully logged operator-only result.
+        const routeChanged =
+          routed.route !== old.route ||
+          routed.approval_lane !== old.approval_lane ||
+          routed.preferred_architecture !== old.preferred_architecture;
         const compatibilityFailure =
           old.status === "blocked" ||
           (old.status === "completed_with_findings" && old.coverage_outcome === "not_applicable");
-        if (compatibilityFailure) return routed;
+        if ((old.status === "pending" || compatibilityFailure) && routeChanged) return routed;
         return {
           ...routed,
           status: old.status,
@@ -744,11 +752,35 @@ export function createAtomicCampaignStore(
       const isPublishedNoTelemetry =
         loaded.state.phase === "completed_with_findings" &&
         loaded.state.coverage_outcome === "no_telem";
+      const isPublishedMissed =
+        loaded.state.phase === "completed_with_findings" &&
+        loaded.state.coverage_outcome === "gaps" &&
+        loaded.coverage.length > 0 &&
+        loaded.coverage.every((coverage) => coverage.outcome === "missed");
+      const isPublishedDetected =
+        loaded.state.phase === "completed" &&
+        loaded.state.coverage_outcome === "verified" &&
+        loaded.coverage.length > 0 &&
+        loaded.coverage.every((coverage) => coverage.outcome === "detected");
       const isCleanPreExecutionBlock =
         loaded.state.phase === "blocked" &&
         loaded.state.coverage_outcome === "pending" &&
         loaded.executions.length === 0 &&
         loaded.coverage.length === 0;
+      const isCleanPostExecutionBlock =
+        loaded.state.phase === "blocked" &&
+        loaded.state.coverage_outcome === "pending" &&
+        loaded.executions.some((execution) => ["execute", "manual"].includes(execution.stage));
+      const isCleanPostCoverageBlock =
+        loaded.state.phase === "blocked" &&
+        ["gaps", "verified"].includes(loaded.state.coverage_outcome) &&
+        loaded.coverage.length > 0 &&
+        loaded.executions.some(
+          (execution) =>
+            ["execute", "manual"].includes(execution.stage) &&
+            execution.status === "passed" &&
+            execution.behavior_success === true
+        );
       const isCleanCompatibilityBlock =
         loaded.state.phase === "blocked" &&
         loaded.state.coverage_outcome === "not_applicable" &&
@@ -762,15 +794,22 @@ export function createAtomicCampaignStore(
       if (
         !isPublishedNotApplicable &&
         !isPublishedNoTelemetry &&
+        !isPublishedMissed &&
+        !isPublishedDetected &&
         !isCleanPreExecutionBlock &&
+        !isCleanPostExecutionBlock &&
+        !isCleanPostCoverageBlock &&
         !isCleanCompatibilityBlock
       ) {
         throw new Error(
-          "Only a published not_applicable/no_telemetry finding or a clean blocked compatibility attempt can be requeued"
+          "Only a published not_applicable/no_telemetry/missed/detected result or a clean blocked compatibility attempt can be requeued"
         );
       }
       if (
-        ((isPublishedNotApplicable || isPublishedNoTelemetry) &&
+        ((isPublishedNotApplicable ||
+          isPublishedNoTelemetry ||
+          isPublishedMissed ||
+          isPublishedDetected) &&
           loaded.state.residual_count !== 0) ||
         loaded.resources.some((resource) => !resource.cleaned)
       ) {
@@ -784,8 +823,11 @@ export function createAtomicCampaignStore(
       }
       const testGuids = loaded.plan.tests.map((test) => test.test_guid);
       const batchScope = new Set(batch.test_guids);
-      if (testGuids.some((guid) => !batchScope.has(guid))) {
+      if (!isPublishedDetected && testGuids.some((guid) => !batchScope.has(guid))) {
         throw new Error("Run contains a test outside the approved batch scope");
+      }
+      if (isPublishedDetected && !loaded.state.approved_at) {
+        throw new Error("Detected-result correction requires the original run approval");
       }
       const testGuidSet = new Set(testGuids);
       const entries = state.entries.filter((entry) => testGuidSet.has(entry.test_guid));
@@ -793,23 +835,27 @@ export function createAtomicCampaignStore(
         entries.length === testGuids.length &&
         entries.every((entry) => {
           if (entry.run_id !== loaded.state.run_id) return false;
-          if (isCleanPreExecutionBlock || isCleanCompatibilityBlock) {
-            return (
-              ["running", "blocked"].includes(entry.status) &&
-              entry.result_published !== true
-            );
+          if (
+            isCleanPreExecutionBlock ||
+            isCleanPostExecutionBlock ||
+            isCleanPostCoverageBlock ||
+            isCleanCompatibilityBlock
+          ) {
+            return ["running", "blocked"].includes(entry.status);
           }
           return (
-            entry.status === "completed_with_findings" &&
-            ["not_applicable", "no_telem"].includes(entry.coverage_outcome ?? "") &&
+            ["completed", "completed_with_findings"].includes(entry.status) &&
+            ["not_applicable", "no_telem", "gaps", "verified"].includes(
+              entry.coverage_outcome ?? ""
+            ) &&
             entry.result_published === true
           );
         });
       if (!entriesMatch) {
         throw new Error(
-          isCleanPreExecutionBlock
-            ? "Requeue requires the clean blocked run to remain attached and unpublished"
-            : "Requeue requires the terminal not_applicable/no_telemetry result to be synchronized and published first"
+          isCleanPreExecutionBlock || isCleanPostExecutionBlock || isCleanPostCoverageBlock
+            ? "Requeue requires the clean blocked run to remain attached"
+            : "Requeue requires the terminal not_applicable/no_telemetry/missed/detected result to be synchronized and published first"
         );
       }
       const updated: CampaignState = {
@@ -943,7 +989,10 @@ function campaignEntry(test: MacosAtomicTest): CampaignEntry {
   const privilege = test.elevation_required ? "root" : "user";
   const isolationReasons = vmIsolationReasons(test, lane);
   const vmIsolation: VmIsolation = isolationReasons.length ? "exclusive_vm" : "shared_vm";
-  const compatibilityKey = `${route}:${test.target_platform}:${test.preferred_distro}:${test.preferred_architecture}:${lane}:${test.executor}:${privilege}`;
+  const preferredArchitecture = ANY_ARCHITECTURE_OVERRIDES.has(test.test_guid)
+    ? "any"
+    : test.preferred_architecture;
+  const compatibilityKey = `${route}:${test.target_platform}:${test.preferred_distro}:${preferredArchitecture}:${lane}:${test.executor}:${privilege}`;
   return {
     technique_id: test.technique_id,
     technique_name: test.technique_name,
@@ -969,10 +1018,14 @@ function campaignEntry(test: MacosAtomicTest): CampaignEntry {
         : `${compatibilityKey}:shared`,
     target_platform: test.target_platform,
     preferred_distro: test.preferred_distro,
-    preferred_architecture: test.preferred_architecture,
+    preferred_architecture: preferredArchitecture,
     target_profile:
       route.startsWith("custom_") || route.startsWith("real_hardware_")
         ? "custom"
+        : route.startsWith("desktop_")
+          ? "desktop"
+        : test.test_guid === "a4b74723-5cee-4300-91c3-5e34166909b4"
+          ? "server"
         : test.risk_flags.includes("gui")
           ? "desktop"
           : test.risk_flags.includes("special_runtime")
@@ -1009,13 +1062,53 @@ function vmIsolationReasons(test: MacosAtomicTest, lane: ApprovalLane): string[]
   return [...reasons].sort();
 }
 
+const READ_ONLY_SIP_STATUS_GUIDS = new Set([
+  "327cc050-9e99-4c8e-99b5-1d15f2fb6b96",
+  "2b73cd9b-b2fb-4357-b9d7-c73c41d9e945",
+]);
+
+const SERVER_RUNNER_ROUTE_OVERRIDES = new Set([
+  ...READ_ONLY_SIP_STATUS_GUIDS,
+  "97a48daa-8bca-4bc0-b1a9-c1d163e762de",
+  "a960185f-aef6-4547-8350-d1ce16680d09",
+  "a4b74723-5cee-4300-91c3-5e34166909b4",
+  "14575d1f-16b3-4a0b-8986-540e42e6a6cc",
+  "5a668739-3a2f-4265-895f-c0e1e0b09eaa",
+  "c3372ae9-b9bf-427a-b330-cb04fecb9c1d",
+]);
+
+const DESKTOP_RUNNER_ROUTE_OVERRIDES = new Set([
+  "3ecd790d-2617-4abf-9a8c-4e8d47da9ee1",
+  "cb790029-17e6-4c43-b96f-002ce5f10938",
+  "12631354-fdbc-4164-92be-402527e748da",
+  "cfb6d400-a269-4c06-a347-6d88d584d5f7",
+  "e57ba07b-3a33-40cd-a892-748273b9b49a",
+  "716e756a-607b-41f3-8204-b214baf37c1d",
+  "e62f8694-cbc7-468f-862c-b10cd07e1757",
+]);
+
+const ANY_ARCHITECTURE_OVERRIDES = new Set([
+  // The pinned dependency chooses cloudflared's arm64 archive at runtime; the
+  // catalog's x86_64 inference comes from the alternate amd64 branch.
+  "228c336a-2f79-4043-8aef-bfa453a611d5",
+]);
+
+const EXTERNAL_TARGET_APPROVAL_OVERRIDES = new Set([
+  // Quick Tunnels publish a temporary public trycloudflare.com endpoint even
+  // though the upstream Atomic catalog currently infers only network/state.
+  "228c336a-2f79-4043-8aef-bfa453a611d5",
+]);
+
 function routeTest(test: MacosAtomicTest): CampaignRoute {
+  if (SERVER_RUNNER_ROUTE_OVERRIDES.has(test.test_guid)) return "server_runner";
+  if (DESKTOP_RUNNER_ROUTE_OVERRIDES.has(test.test_guid)) return "desktop_runner";
   if (test.risk_flags.includes("real_hardware")) {
     return test.manual ? "real_hardware_operator" : "real_hardware_runner";
   }
   const special = test.risk_flags.includes("special_runtime");
   const privilegedPolicyChange =
-    test.risk_flags.includes("sip") || test.risk_flags.includes("tcc");
+    (test.risk_flags.includes("sip") && !READ_ONLY_SIP_STATUS_GUIDS.has(test.test_guid)) ||
+    test.risk_flags.includes("tcc");
   if (test.manual) {
     return special || privilegedPolicyChange ? "custom_operator" : "desktop_operator";
   }
@@ -1029,12 +1122,13 @@ function routeTest(test: MacosAtomicTest): CampaignRoute {
 }
 
 function approvalLane(test: MacosAtomicTest): ApprovalLane {
+  if (EXTERNAL_TARGET_APPROVAL_OVERRIDES.has(test.test_guid)) return "external_target";
   if (test.risk_flags.includes("external_target")) return "external_target";
   if (
     test.risk_flags.includes("destructive") ||
     test.risk_flags.includes("reboot") ||
     test.risk_flags.includes("tcc") ||
-    test.risk_flags.includes("sip")
+    (test.risk_flags.includes("sip") && !READ_ONLY_SIP_STATUS_GUIDS.has(test.test_guid))
   ) {
     return "high_risk";
   }

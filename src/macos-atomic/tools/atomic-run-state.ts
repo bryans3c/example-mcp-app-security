@@ -102,7 +102,72 @@ export type AtomicTestPlan = {
   readonly name: string;
   readonly executor: string;
   readonly execution_mode: "runner" | "operator";
-  readonly execution_adapter?: "bash_interactive";
+  readonly execution_adapter?:
+    | "bash_interactive"
+    | "macos_usr_bin_echo_compat"
+    | "macos_t1036_006_compat"
+    | "macos_t1046_port_scan_compat"
+    | "macos_t1027_001_dd_multiline_compat"
+    | "macos_t1685_006_cat_dd_multiline_compat"
+    | "macos_t1685_006_srm_multiline_compat"
+    | "macos_t1685_006_realtime_log_clearance_compat"
+    | "macos_t1496_yes_bounded_compat"
+    | "macos_t1497_003_local_ping_compat"
+    | "macos_t1059_004_local_pipe_compat"
+    | "macos_t1059_004_awk_shell_compat"
+    | "macos_t1548_003_sudo_vim_compat"
+    | "macos_t1548_003_bsd_sed_compat"
+    | "macos_t1485_dd_count_bytes_compat"
+    | "macos_t1486_7z_password_compat"
+    | "macos_t1548_001_setuid_path_compat"
+    | "macos_t1027_013_powershell_compat"
+    | "macos_t1059_004_ping_compat"
+    | "macos_t1552_001_find_loop_compat"
+    | "macos_t1040_bpf_bounded_compat"
+    | "macos_t1090_001_proxy_verify_compat"
+    | "macos_t1135_network_share_compat"
+    | "macos_t1078_003_sysadminctl_compat"
+    | "macos_t1078_003_dsenableroot_compat"
+    | "macos_t1564_001_xattr_scan_compat"
+    | "macos_t1685_006_find_multiline_compat"
+    | "macos_t1048_ssh_push_local_compat"
+    | "macos_t1048_ssh_pull_local_compat"
+    | "macos_t1048_002_curl_local_compat"
+    | "macos_t1074_001_discovery_local_compat"
+    | "macos_t1659_proxy_injection_local_compat"
+    | "macos_t1070_008_mailbox_fixture_compat"
+    | "macos_t1222_002_chattr_compat"
+    | "macos_t1059_004_cpan_shell_compat"
+    | "macos_t1059_004_emacs_shell_compat"
+    | "macos_t1531_password_change_compat"
+    | "macos_t1546_018_python_hook_compat"
+    | "macos_t1564_001_finder_hidden_verify_compat"
+    | "macos_t1685_gatekeeper_verify_compat"
+    | "macos_t1497_001_virtualization_compat"
+    | "macos_t1070_006_birthtime_compat"
+    | "macos_t1529_reboot_path_compat"
+    | "macos_t1529_shutdown_path_compat"
+    | "macos_t1555_001_keychain_import_compat"
+    | "macos_t1553_004_root_ca_compat"
+    | "macos_t1059_002_applescript_loopback_compat"
+    | "macos_t1021_005_ard_compat"
+    | "macos_t1490_timemachine_compat"
+    | "macos_t1555_003_safari_cookie_compat"
+    | "macos_t1113_screencapture_compat"
+    | "macos_t1110_004_ssh_credential_stuffing_compat"
+    | "macos_t1098_004_authorized_keys_compat"
+    | "macos_t1056_002_prompt_compat"
+    | "macos_t1552_001_lazagne_compat"
+    | "macos_t1539_cookie_debug_compat"
+    | "macos_t1572_cloudflare_compat"
+    | "macos_t1685_vendor_fixture_compat"
+    | "macos_manual_t1036_006_compat"
+    | "macos_manual_t1037_002_compat"
+    | "macos_manual_t1048_003_loopback_compat"
+    | "macos_manual_t1176_chromium_compat"
+    | "macos_manual_t1176_firefox_compat"
+    | "macos_manual_t1647_compat"
+    | "macos_manual_t1690_compat";
   readonly elevation_required: boolean;
   readonly required_capabilities: readonly TargetCapability[];
   readonly definition_digest: string;
@@ -113,6 +178,13 @@ export type AtomicTestPlan = {
     | { readonly kind: "stderr_contains"; readonly value: string }
     | { readonly kind: "target_path_exists"; readonly path: string }
     | { readonly kind: "target_path_absent"; readonly path: string }
+    | { readonly kind: "target_path_timestamp_equals"; readonly path: string; readonly field: "atime" | "mtime"; readonly epoch_seconds: number }
+    | { readonly kind: "target_path_timestamp_matches"; readonly path: string; readonly field: "atime" | "mtime"; readonly reference_path: string }
+    | { readonly kind: "target_path_mode_equals"; readonly path: string; readonly mode: string }
+    | { readonly kind: "target_path_size_equals"; readonly path: string; readonly bytes: number }
+    | { readonly kind: "target_path_owner_equals"; readonly path: string; readonly owner: string; readonly group?: string }
+    | { readonly kind: "target_path_xattr_absent"; readonly path: string; readonly name: string }
+    | { readonly kind: "target_path_flags_contains"; readonly path: string; readonly value: string }
     | { readonly kind: "target_path_contains"; readonly path: string; readonly value: string }
     | { readonly kind: "target_path_not_contains"; readonly path: string; readonly value: string }
     | { readonly kind: "target_rebooted" }
@@ -200,6 +272,12 @@ export type AtomicPlan = {
     readonly command: readonly string[];
     readonly elevated?: boolean;
   }[];
+  readonly runtime_credentials?: {
+    readonly aws?: {
+      readonly source_profile: string;
+      readonly target_profile: string;
+    };
+  };
   readonly instrumentation?: {
     readonly elastic_agent: {
       readonly stack_version: string;
@@ -250,6 +328,7 @@ export type AtomicCoverageRecord = {
   readonly outcome: "detected" | "missed" | "no_telemetry" | "not_applicable";
   readonly raw_event_count?: number;
   readonly alert_count?: number;
+  readonly attributable_rule_names?: readonly string[];
   readonly detector?: string;
   readonly evidence?: string;
   readonly reason?: string;
@@ -296,6 +375,18 @@ export type LoadedRun = {
   executions: AtomicExecutionRecord[];
   coverage: AtomicCoverageRecord[];
 };
+
+const AUTOMATED_MANUAL_EXECUTION_ADAPTERS = new Set<
+  NonNullable<AtomicTestPlan["execution_adapter"]>
+>([
+  "macos_manual_t1036_006_compat",
+  "macos_manual_t1037_002_compat",
+  "macos_manual_t1048_003_loopback_compat",
+  "macos_manual_t1176_chromium_compat",
+  "macos_manual_t1176_firefox_compat",
+  "macos_manual_t1647_compat",
+  "macos_manual_t1690_compat",
+]);
 
 export class AtomicRunError extends Error {
   constructor(
@@ -562,24 +653,44 @@ export function createAtomicRunStore(
         );
       }
       const manualExecutor = test.executor.toLowerCase().includes("manual");
-      if (manualExecutor && (test.execution_mode !== "operator" || !test.manual)) {
+      const automatedManualExecutor =
+        manualExecutor &&
+        test.execution_adapter !== undefined &&
+        AUTOMATED_MANUAL_EXECUTION_ADAPTERS.has(test.execution_adapter);
+      if (
+        manualExecutor &&
+        !automatedManualExecutor &&
+        (test.execution_mode !== "operator" || !test.manual)
+      ) {
         reject(loaded, `Manual test ${test.test_guid} requires an approved operator procedure`);
       }
       if (
         manualExecutor &&
+        !automatedManualExecutor &&
         !test.success_criteria.some((criterion) => criterion.kind === "manual_evidence")
       ) {
         reject(loaded, `Manual test ${test.test_guid} requires manual_evidence success criteria`);
       }
       if (
         manualExecutor &&
+        !automatedManualExecutor &&
         test.cleanup_expected &&
         !test.manual?.cleanup_steps?.length
       ) {
         reject(loaded, `Manual test ${test.test_guid} requires approved cleanup steps`);
       }
       if (
+        automatedManualExecutor &&
+        (test.execution_mode !== "runner" || test.manual !== undefined)
+      ) {
+        reject(
+          loaded,
+          `Automated manual compatibility test ${test.test_guid} requires runner mode without operator steps`
+        );
+      }
+      if (
         manualExecutor &&
+        !automatedManualExecutor &&
         test.required_capabilities.includes("browser") &&
         (test.source_assets?.length ?? 0) > 0
       ) {
@@ -602,20 +713,25 @@ export function createAtomicRunStore(
         reject(loaded, `Automated test ${test.test_guid} requires execution_mode=runner`);
       }
       if (
-        test.execution_adapter === "bash_interactive" &&
+        test.execution_adapter !== undefined &&
         (plan.scope.platform !== "macos" ||
-          !["sh", "bash"].includes(test.executor.toLowerCase()))
+          (!["sh", "bash"].includes(test.executor.toLowerCase()) &&
+            !automatedManualExecutor &&
+            !(
+              test.execution_adapter === "macos_t1027_013_powershell_compat" &&
+              test.executor.toLowerCase() === "powershell"
+            )))
       ) {
         reject(
           loaded,
-          `Test ${test.test_guid} uses bash_interactive outside a macOS sh/bash executor`
+          `Test ${test.test_guid} uses an execution adapter outside its approved macOS executor`
         );
       }
       if (!test.success_criteria?.length) {
         reject(loaded, `Test ${test.test_guid} needs at least one behavior success criterion`);
       }
       if (
-        !test.executor.includes("manual") &&
+        (!test.executor.includes("manual") || automatedManualExecutor) &&
         test.success_criteria.some((criterion) => criterion.kind === "manual_evidence")
       ) {
         reject(loaded, `Automated test ${test.test_guid} cannot use manual_evidence`);

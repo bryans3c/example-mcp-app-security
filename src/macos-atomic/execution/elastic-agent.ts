@@ -120,6 +120,41 @@ export type ElasticEndpointReadiness = {
   >;
 };
 
+export type ElasticTemplateSanitization = {
+  readonly ok: boolean;
+  readonly uninstall: Pick<ProcessResult, "exitCode" | "timedOut" | "stdout" | "stderr">;
+  readonly cleanup: Pick<ProcessResult, "exitCode" | "timedOut" | "stdout" | "stderr">;
+  readonly agent_path_absent: boolean;
+  readonly endpoint_path_absent: boolean;
+  readonly agent_link_absent: boolean;
+  readonly elastic_processes_absent: boolean;
+};
+
+export type ElasticTemplateIdentityAbsence = {
+  readonly ok: boolean;
+  readonly agent_path_absent: boolean;
+  readonly endpoint_path_absent: boolean;
+  readonly agent_link_absent: boolean;
+  readonly elastic_processes_absent: boolean;
+};
+
+export type ElasticTemplateResidue = {
+  readonly agent_tree: Pick<ProcessResult, "exitCode" | "timedOut" | "stdout" | "stderr">;
+  readonly launchd_entries: Pick<ProcessResult, "exitCode" | "timedOut" | "stdout" | "stderr">;
+};
+
+const TEMPLATE_SANITIZER = String.raw`set -eu
+user_home="$1"
+if [ -d /var/tmp/macos-atomic-runs ]; then
+  find /var/tmp/macos-atomic-runs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+fi
+rm -f "$user_home/.zsh_history" "$user_home/.bash_history"
+rm -rf "$user_home/.zsh_sessions"
+rm -f /usr/local/bin/elastic-agent
+`;
+
+export const MACOS_TEST_BINARY = "/bin/test";
+
 export function elasticAgentArtifact(version: string, machine: string): {
   architecture: "x86_64" | "arm64";
   filename: string;
@@ -191,6 +226,95 @@ export async function installAndVerifyElasticAgent(
     installation,
     status,
     endpoint_readiness: endpointReadiness,
+  };
+}
+
+export async function sanitizeElasticAgentForTemplate(
+  scope: AtomicPlan["scope"]
+): Promise<ElasticTemplateSanitization> {
+  const uninstall = await runOnTarget(
+    scope,
+    [
+      "sudo",
+      "/Library/Elastic/Agent/elastic-agent",
+      "uninstall",
+      "--force",
+    ],
+    10 * 60_000
+  );
+  const cleanup = await runOnTarget(
+    scope,
+    ["sudo", "/bin/sh", "-s", "--", `/Users/${scope.execution_user}`],
+    2 * 60_000,
+    { input: TEMPLATE_SANITIZER }
+  );
+  const absence = await verifyElasticTemplateIdentityAbsent(scope);
+  return {
+    ok:
+      uninstall.exitCode === 0 &&
+      !uninstall.timedOut &&
+      cleanup.exitCode === 0 &&
+      !cleanup.timedOut &&
+      absence.ok,
+    uninstall: pickStatus(uninstall),
+    cleanup: pickStatus(cleanup),
+    agent_path_absent: absence.agent_path_absent,
+    endpoint_path_absent: absence.endpoint_path_absent,
+    agent_link_absent: absence.agent_link_absent,
+    elastic_processes_absent: absence.elastic_processes_absent,
+  };
+}
+
+export async function verifyElasticTemplateIdentityAbsent(
+  scope: AtomicPlan["scope"]
+): Promise<ElasticTemplateIdentityAbsence> {
+  const [agentPath, endpointPath, agentLink, processes] = await Promise.all([
+    runOnTarget(scope, [MACOS_TEST_BINARY, "!", "-e", "/Library/Elastic/Agent"], 30_000),
+    runOnTarget(scope, [MACOS_TEST_BINARY, "!", "-e", "/Library/Elastic/Endpoint"], 30_000),
+    runOnTarget(scope, [MACOS_TEST_BINARY, "!", "-e", "/usr/local/bin/elastic-agent"], 30_000),
+    runOnTarget(scope, ["/usr/bin/pgrep", "-if", "elastic-(agent|endpoint)"], 30_000),
+  ]);
+  const agentPathAbsent = agentPath.exitCode === 0 && !agentPath.timedOut;
+  const endpointPathAbsent = endpointPath.exitCode === 0 && !endpointPath.timedOut;
+  const agentLinkAbsent = agentLink.exitCode === 0 && !agentLink.timedOut;
+  const elasticProcessesAbsent = processes.exitCode === 1 && !processes.timedOut;
+  return {
+    ok: agentPathAbsent && endpointPathAbsent && agentLinkAbsent && elasticProcessesAbsent,
+    agent_path_absent: agentPathAbsent,
+    endpoint_path_absent: endpointPathAbsent,
+    agent_link_absent: agentLinkAbsent,
+    elastic_processes_absent: elasticProcessesAbsent,
+  };
+}
+
+export async function inspectElasticTemplateResidue(
+  scope: AtomicPlan["scope"]
+): Promise<ElasticTemplateResidue> {
+  const [agentTree, launchdEntries] = await Promise.all([
+    runOnTarget(
+      scope,
+      ["sudo", "/usr/bin/find", "/Library/Elastic/Agent", "-xdev", "-maxdepth", "5", "-print"],
+      30_000
+    ),
+    runOnTarget(
+      scope,
+      [
+        "sudo",
+        "/usr/bin/find",
+        "/Library/LaunchDaemons",
+        "/Library/LaunchAgents",
+        "-maxdepth",
+        "1",
+        "-iname",
+        "*elastic*",
+        "-print",
+      ],
+      30_000
+    ),
+  ]);
+  return {
+    agent_tree: pickStatus(agentTree),
+    launchd_entries: pickStatus(launchdEntries),
   };
 }
 

@@ -53,12 +53,24 @@ export async function verifyApprovedPackages(
 }> {
   const results: PackageVerification[] = [];
   for (const approvedPackage of packages) {
-    const result = await runOnTarget(
+    let result = await runOnTarget(
       scope,
       ["brew", "list", "--versions", approvedPackage.name],
       30_000
     );
-    const parsed = parseBrewQuery(result.stdout, approvedPackage.name);
+    let parsed = parseBrewQuery(result.stdout, approvedPackage.name);
+    if (result.exitCode !== 0 || result.timedOut || parsed === undefined) {
+      const caskResult = await runOnTarget(
+        scope,
+        ["brew", "list", "--cask", "--versions", approvedPackage.name],
+        30_000
+      );
+      const caskParsed = parseBrewQuery(caskResult.stdout, approvedPackage.name);
+      if (caskResult.exitCode === 0 && !caskResult.timedOut && caskParsed !== undefined) {
+        result = caskResult;
+        parsed = caskParsed;
+      }
+    }
     const ok =
       result.exitCode === 0 &&
       !result.timedOut &&

@@ -11,16 +11,56 @@ import {
   parseBrewQuery,
 } from "./approved-packages.js";
 import {
+  MACOS_TEST_BINARY,
   elasticAgentArtifact,
   elasticEndpointInstallTestPassed,
   isElasticAgentHealthy,
   isElasticSystemExtensionActiveAndEnabled,
 } from "./elastic-agent.js";
+import {
+  normalizeTelemetryQueryForResult,
+  resultAlertAttributionReview,
+} from "./elastic-results.js";
 import { shellQuoteArg, sshTargetDestination } from "./target.js";
 import { tartCloneTimeoutMs, tartListContains, tartRunArgs } from "./tart.js";
 import type { AtomicPlan } from "../tools/atomic-run-state.js";
 
 describe("macOS runtime helpers", () => {
+  it("uses the macOS test binary for template absence probes", () => {
+    expect(MACOS_TEST_BINARY).toBe("/bin/test");
+  });
+
+  it("normalizes result-link wildcard queries to the established mapping", () => {
+    expect(normalizeTelemetryQueryForResult({
+      bool: {
+        filter: [
+          { wildcard: { "process.command_line": { value: "*Info.plist*" } } },
+        ],
+      },
+    })).toEqual({
+      bool: {
+        filter: [
+          { wildcard: { "process.command_line": "*Info.plist*" } },
+        ],
+      },
+    });
+  });
+
+  it("publishes attributable alert rule names in the established result object", () => {
+    expect(resultAlertAttributionReview({
+      test_guid: "00000000-0000-4000-8000-000000000000",
+      outcome: "detected",
+      raw_event_count: 4,
+      alert_count: 2,
+      attributable_rule_names: ["Rule A", "Rule B"],
+      detector: "elastic",
+    })).toEqual({
+      schema_version: 2,
+      attributable_alert_count: 2,
+      attributable_rule_names: ["Rule A", "Rule B"],
+    });
+  });
+
   it("binds Homebrew package versions", () => {
     expect(approvedPackageInstallSpec({
       manager: "brew",
@@ -31,6 +71,10 @@ describe("macOS runtime helpers", () => {
     expect(parseBrewQuery("bash 5.3.3\n", "bash")).toEqual({
       status: "install ok installed",
       version: "5.3.3",
+    });
+    expect(parseBrewQuery("mitmproxy 12.3.1\n", "mitmproxy")).toEqual({
+      status: "install ok installed",
+      version: "12.3.1",
     });
   });
 

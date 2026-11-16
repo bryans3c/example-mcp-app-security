@@ -57,6 +57,44 @@ export const successCriterionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("target_path_exists"), path: targetPathSchema }),
   z.object({ kind: z.literal("target_path_absent"), path: targetPathSchema }),
   z.object({
+    kind: z.literal("target_path_timestamp_equals"),
+    path: targetPathSchema,
+    field: z.enum(["atime", "mtime"]),
+    epoch_seconds: z.number().int().min(-2_208_988_800).max(32_503_680_000),
+  }),
+  z.object({
+    kind: z.literal("target_path_timestamp_matches"),
+    path: targetPathSchema,
+    field: z.enum(["atime", "mtime"]),
+    reference_path: targetPathSchema,
+  }),
+  z.object({
+    kind: z.literal("target_path_mode_equals"),
+    path: targetPathSchema,
+    mode: z.string().regex(/^[0-7]{3,4}$/),
+  }),
+  z.object({
+    kind: z.literal("target_path_size_equals"),
+    path: targetPathSchema,
+    bytes: z.number().int().min(0).max(1_099_511_627_776),
+  }),
+  z.object({
+    kind: z.literal("target_path_owner_equals"),
+    path: targetPathSchema,
+    owner: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/),
+    group: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/).optional(),
+  }),
+  z.object({
+    kind: z.literal("target_path_xattr_absent"),
+    path: targetPathSchema,
+    name: z.string().regex(/^[A-Za-z0-9_.-]{1,255}$/),
+  }),
+  z.object({
+    kind: z.literal("target_path_flags_contains"),
+    path: targetPathSchema,
+    value: z.string().min(1).max(128),
+  }),
+  z.object({
     kind: z.literal("target_path_contains"),
     path: targetPathSchema,
     value: outputNeedleSchema,
@@ -152,7 +190,75 @@ export const testPlanSchema = z.object({
   name: z.string().min(1),
   executor: z.string().min(1),
   execution_mode: z.enum(["runner", "operator"]),
-  execution_adapter: z.enum(["bash_interactive"]).optional(),
+  execution_adapter: z
+    .enum([
+      "bash_interactive",
+      "macos_usr_bin_echo_compat",
+      "macos_t1036_006_compat",
+      "macos_t1046_port_scan_compat",
+      "macos_t1027_001_dd_multiline_compat",
+      "macos_t1685_006_cat_dd_multiline_compat",
+      "macos_t1685_006_srm_multiline_compat",
+      "macos_t1685_006_realtime_log_clearance_compat",
+      "macos_t1496_yes_bounded_compat",
+      "macos_t1497_003_local_ping_compat",
+      "macos_t1059_004_local_pipe_compat",
+      "macos_t1059_004_awk_shell_compat",
+      "macos_t1548_003_sudo_vim_compat",
+      "macos_t1548_003_bsd_sed_compat",
+      "macos_t1485_dd_count_bytes_compat",
+      "macos_t1486_7z_password_compat",
+      "macos_t1548_001_setuid_path_compat",
+      "macos_t1027_013_powershell_compat",
+      "macos_t1059_004_ping_compat",
+      "macos_t1552_001_find_loop_compat",
+      "macos_t1040_bpf_bounded_compat",
+      "macos_t1090_001_proxy_verify_compat",
+      "macos_t1135_network_share_compat",
+      "macos_t1078_003_sysadminctl_compat",
+      "macos_t1078_003_dsenableroot_compat",
+      "macos_t1564_001_xattr_scan_compat",
+      "macos_t1685_006_find_multiline_compat",
+      "macos_t1048_ssh_push_local_compat",
+      "macos_t1048_ssh_pull_local_compat",
+      "macos_t1048_002_curl_local_compat",
+      "macos_t1074_001_discovery_local_compat",
+      "macos_t1659_proxy_injection_local_compat",
+      "macos_t1070_008_mailbox_fixture_compat",
+      "macos_t1222_002_chattr_compat",
+      "macos_t1059_004_cpan_shell_compat",
+      "macos_t1059_004_emacs_shell_compat",
+      "macos_t1531_password_change_compat",
+      "macos_t1546_018_python_hook_compat",
+      "macos_t1564_001_finder_hidden_verify_compat",
+      "macos_t1685_gatekeeper_verify_compat",
+      "macos_t1497_001_virtualization_compat",
+      "macos_t1070_006_birthtime_compat",
+      "macos_t1529_reboot_path_compat",
+      "macos_t1529_shutdown_path_compat",
+      "macos_t1555_001_keychain_import_compat",
+      "macos_t1553_004_root_ca_compat",
+      "macos_t1059_002_applescript_loopback_compat",
+      "macos_t1021_005_ard_compat",
+      "macos_t1490_timemachine_compat",
+      "macos_t1555_003_safari_cookie_compat",
+      "macos_t1113_screencapture_compat",
+      "macos_t1110_004_ssh_credential_stuffing_compat",
+      "macos_t1098_004_authorized_keys_compat",
+      "macos_t1056_002_prompt_compat",
+      "macos_t1552_001_lazagne_compat",
+      "macos_t1539_cookie_debug_compat",
+      "macos_t1572_cloudflare_compat",
+      "macos_t1685_vendor_fixture_compat",
+      "macos_manual_t1036_006_compat",
+      "macos_manual_t1037_002_compat",
+      "macos_manual_t1048_003_loopback_compat",
+      "macos_manual_t1176_chromium_compat",
+      "macos_manual_t1176_firefox_compat",
+      "macos_manual_t1647_compat",
+      "macos_manual_t1690_compat",
+    ])
+    .optional(),
   elevation_required: z.boolean(),
   required_capabilities: z.array(targetCapabilitySchema).max(20),
   definition_digest: z.string().regex(/^[0-9a-f]{64}$/i),
@@ -173,24 +279,41 @@ export const testPlanSchema = z.object({
     .optional(),
 }).superRefine((test, context) => {
   const manualExecutor = test.executor.toLowerCase().includes("manual");
+  const automatedManualExecutor =
+    manualExecutor &&
+    test.execution_adapter !== undefined &&
+    [
+      "macos_manual_t1036_006_compat",
+      "macos_manual_t1037_002_compat",
+      "macos_manual_t1048_003_loopback_compat",
+      "macos_manual_t1176_chromium_compat",
+      "macos_manual_t1176_firefox_compat",
+      "macos_manual_t1647_compat",
+      "macos_manual_t1690_compat",
+    ].includes(test.execution_adapter);
   if (
-    test.execution_adapter === "bash_interactive" &&
-    !["sh", "bash"].includes(test.executor.toLowerCase())
+    test.execution_adapter !== undefined &&
+    !["sh", "bash"].includes(test.executor.toLowerCase()) &&
+    !automatedManualExecutor &&
+    !(
+      test.execution_adapter === "macos_t1027_013_powershell_compat" &&
+      test.executor.toLowerCase() === "powershell"
+    )
   ) {
     context.addIssue({
       code: "custom",
       path: ["execution_adapter"],
-      message: "bash_interactive is allowed only for sh or bash executors",
+      message: "the selected execution adapter is not allowed for this executor",
     });
   }
-  if (manualExecutor && test.execution_mode !== "operator") {
+  if (manualExecutor && !automatedManualExecutor && test.execution_mode !== "operator") {
     context.addIssue({
       code: "custom",
       path: ["execution_mode"],
       message: "manual executors require execution_mode=operator",
     });
   }
-  if (manualExecutor && !test.manual) {
+  if (manualExecutor && !automatedManualExecutor && !test.manual) {
     context.addIssue({
       code: "custom",
       path: ["manual"],
@@ -199,6 +322,7 @@ export const testPlanSchema = z.object({
   }
   if (
     manualExecutor &&
+    !automatedManualExecutor &&
     !test.success_criteria.some((criterion) => criterion.kind === "manual_evidence")
   ) {
     context.addIssue({
@@ -207,11 +331,26 @@ export const testPlanSchema = z.object({
       message: "manual executors require manual_evidence success criteria",
     });
   }
-  if (manualExecutor && test.cleanup_expected && !test.manual?.cleanup_steps?.length) {
+  if (
+    manualExecutor &&
+    !automatedManualExecutor &&
+    test.cleanup_expected &&
+    !test.manual?.cleanup_steps?.length
+  ) {
     context.addIssue({
       code: "custom",
       path: ["manual", "cleanup_steps"],
       message: "manual executors with cleanup_expected require cleanup steps",
+    });
+  }
+  if (
+    automatedManualExecutor &&
+    (test.execution_mode !== "runner" || test.manual !== undefined)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["execution_mode"],
+      message: "automated manual compatibility adapters require runner mode without operator steps",
     });
   }
   if (!manualExecutor && test.execution_mode !== "runner") {
@@ -258,7 +397,9 @@ export const atomicPlanSchema = z.object({
     architecture: z.enum(["arm64", "x86_64"]),
     target_image: z
       .string()
-      .regex(/^ghcr\.io\/[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$/i)
+      .regex(
+        /^(?:ghcr\.io\/[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}|tvm\+file:\/\/\/[^#\r\n]+\.tvm#sha256=[0-9a-f]{64})$/i
+      )
       .optional(),
     ssh_identity_file: z.string().min(1).max(4_096).optional(),
     classification: z.literal("owned-disposable-lab"),
@@ -281,6 +422,19 @@ export const atomicPlanSchema = z.object({
     })
     .optional(),
   setup_steps: z.array(setupStepSchema).min(1).max(20).optional(),
+  runtime_credentials: z
+    .object({
+      aws: z
+        .object({
+          source_profile: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/),
+          target_profile: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/),
+        })
+        .optional(),
+    })
+    .refine((value) => value.aws !== undefined, {
+      message: "runtime_credentials must configure at least one provider",
+    })
+    .optional(),
   instrumentation: z
     .object({
       elastic_agent: elasticAgentPlanSchema,
@@ -310,6 +464,16 @@ export const atomicPlanSchema = z.object({
       message: "SSH targets require an identity file",
     });
   }
+  if (
+    plan.runtime_credentials !== undefined &&
+    (plan.scope.target_kind !== "tart" || plan.scope.lifecycle !== "ephemeral")
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["runtime_credentials"],
+      message: "runtime credentials are allowed only on fresh ephemeral Tart targets",
+    });
+  }
 });
 
 export const resourceSchema = z.object({
@@ -337,6 +501,7 @@ export const coverageRecordSchema = z.object({
   outcome: z.enum(["detected", "missed", "no_telemetry", "not_applicable"]),
   raw_event_count: z.number().int().min(0).optional(),
   alert_count: z.number().int().min(0).optional(),
+  attributable_rule_names: z.array(z.string().min(1).max(1_024)).max(1_000).optional(),
   detector: z.string().optional(),
   evidence: z.string().optional(),
   reason: z.string().optional(),
@@ -346,6 +511,13 @@ export const coverageRecordSchema = z.object({
       code: "custom",
       path: ["reason"],
       message: "not_applicable coverage requires a reason",
+    });
+  }
+  if (record.alert_count === 0 && record.attributable_rule_names?.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["attributable_rule_names"],
+      message: "attributable rule names require at least one attributable alert",
     });
   }
 });

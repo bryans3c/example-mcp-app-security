@@ -163,6 +163,7 @@ export function buildAtomicResultDocuments(
             test.telemetry
           ),
           test: resultTest(test),
+          alert_attribution_review: resultAlertAttributionReview(coverage),
           execution: execution
             ? {
                 stage: execution.stage,
@@ -280,17 +281,38 @@ function resultLinks(
       url: `${base}/app/discover`,
       available: available && Boolean(telemetry?.raw),
       indices: telemetry?.raw?.indices,
-      query: telemetry?.raw?.query,
+      query: normalizeTelemetryQueryForResult(telemetry?.raw?.query),
       reason: available ? undefined : reason,
     }),
     alerts: compact({
       url: `${base}/app/security/alerts`,
       available: available && Boolean(telemetry?.alerts),
       indices: telemetry?.alerts?.indices,
-      query: telemetry?.alerts?.query,
+      query: normalizeTelemetryQueryForResult(telemetry?.alerts?.query),
       reason: available ? undefined : reason,
     }),
   };
+}
+
+export function normalizeTelemetryQueryForResult(query: unknown): unknown {
+  if (Array.isArray(query)) return query.map(normalizeTelemetryQueryForResult);
+  if (!query || typeof query !== "object") return query;
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(query as Record<string, unknown>)) {
+    if (key === "wildcard" && value && typeof value === "object" && !Array.isArray(value)) {
+      result[key] = Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([field, clause]) => [
+          field,
+          clause && typeof clause === "object" && !Array.isArray(clause) && "value" in clause
+            ? (clause as Record<string, unknown>).value
+            : normalizeTelemetryQueryForResult(clause),
+        ])
+      );
+    } else {
+      result[key] = normalizeTelemetryQueryForResult(value);
+    }
+  }
+  return result;
 }
 
 function resultTest(test: AtomicTestPlan): Record<string, unknown> {
@@ -319,6 +341,17 @@ function resultCoverage(coverage: AtomicCoverageRecord | undefined): Record<stri
         reason: coverage.reason,
       })
     : { outcome: "not_recorded" };
+}
+
+export function resultAlertAttributionReview(
+  coverage: AtomicCoverageRecord | undefined
+): Record<string, unknown> | undefined {
+  if (!coverage) return undefined;
+  return {
+    schema_version: 2,
+    attributable_alert_count: coverage.alert_count ?? 0,
+    attributable_rule_names: coverage.attributable_rule_names ?? [],
+  };
 }
 
 function findExecution(

@@ -110,6 +110,63 @@ describe("digest-gated macOS run state", () => {
     expect(atomicPlanSchema.safeParse(missing).success).toBe(false);
   });
 
+  it("accepts a SHA-256-bound local Tart archive", () => {
+    const value = plan("local-image-test");
+    const local: AtomicPlan = {
+      ...value,
+      scope: {
+        ...value.scope,
+        target_image: `tvm+file:///tmp/prepared-image.tvm#sha256=${"f".repeat(64)}`,
+      },
+    };
+    expect(atomicPlanSchema.safeParse(local).success).toBe(true);
+  });
+
+  it("allows only reviewed adapters to automate pinned manual Atomics", () => {
+    const value = plan("manual-adapter-test");
+    const automated = {
+      ...value,
+      tests: [{
+        ...value.tests[0]!,
+        executor: "manual",
+        execution_mode: "runner" as const,
+        execution_adapter: "macos_manual_t1176_firefox_compat" as const,
+        required_capabilities: ["shell", "browser"] as const,
+        success_criteria: [{
+          kind: "stdout_contains" as const,
+          value: "ATOMIC_T1176_FIREFOX_EXTENSION_LOADED",
+        }],
+      }],
+      scope: {
+        ...value.scope,
+        capabilities: ["shell", "powershell", "browser"] as const,
+      },
+    };
+    expect(atomicPlanSchema.safeParse(automated).success).toBe(true);
+
+    const unreviewed = {
+      ...automated,
+      tests: [{ ...automated.tests[0]!, execution_adapter: undefined }],
+    };
+    expect(atomicPlanSchema.safeParse(unreviewed).success).toBe(false);
+  });
+
+  it("allows the reviewed srm multiline adapter only for a shell executor", () => {
+    const value = plan("srm-adapter-test");
+    const reviewed = {
+      ...value,
+      tests: [{
+        ...value.tests[0]!,
+        execution_adapter: "macos_t1685_006_srm_multiline_compat" as const,
+      }],
+    };
+    expect(atomicPlanSchema.safeParse(reviewed).success).toBe(true);
+    expect(atomicPlanSchema.safeParse({
+      ...reviewed,
+      tests: [{ ...reviewed.tests[0]!, executor: "powershell" }],
+    }).success).toBe(false);
+  });
+
   it("allows a blocked run to mark an existing orphaned resource as cleaned", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "macos-atomic-run-"));
     roots.push(root);

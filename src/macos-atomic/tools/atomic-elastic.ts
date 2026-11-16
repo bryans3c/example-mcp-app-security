@@ -21,6 +21,9 @@ import {
 } from "./atomic-run-state.js";
 import { textResult } from "./atomic-run.js";
 
+const DEFAULT_ALERT_GRACE_SECONDS = 120;
+const MAX_ALERT_GRACE_SECONDS = 900;
+
 const elasticSchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("discover"),
@@ -119,7 +122,14 @@ export function registerAtomicElasticTool(
             true
           );
         }
-        const [rawCount, alertCount] = await Promise.all([
+        const execution = loaded.executions.find(
+          (record) =>
+            record.test_guid === test.test_guid &&
+            (record.stage === "execute" || record.stage === "manual")
+        );
+        const alertGrace = await waitForAlertGracePeriod(execution?.ended_at);
+        const effectiveEnd = laterTimestamp(parsed.end, new Date().toISOString());
+        const [rawCount, alertSummary] = await Promise.all([
           elasticCount(
             rawQuery,
             parsed.start,
@@ -127,19 +137,15 @@ export function registerAtomicElasticTool(
             parsed.timestamp_field,
             loaded.plan.instrumentation?.elastic_agent.elasticsearch_url
           ),
-          elasticCount(
+          elasticAlertSummary(
             alertQuery,
             parsed.start,
-            parsed.end,
+            effectiveEnd,
             parsed.timestamp_field,
             loaded.plan.instrumentation?.elastic_agent.elasticsearch_url
           ),
         ]);
-        const execution = loaded.executions.find(
-          (record) =>
-            record.test_guid === test.test_guid &&
-            (record.stage === "execute" || record.stage === "manual")
-        );
+        const alertCount = alertSummary.count;
         const behaviorConfirmed =
           execution?.status === "passed" && execution.behavior_success === true;
         const outcome: AtomicCoverageRecord["outcome"] =
@@ -153,9 +159,15 @@ export function registerAtomicElasticTool(
         const evidencePath = writeCoverageEvidence(loaded.dir, {
           test_guid: test.test_guid,
           start: parsed.start,
-          end: parsed.end,
+          end: effectiveEnd,
+          raw_end: parsed.end,
+          alert_end: effectiveEnd,
+          requested_end: parsed.end,
+          alert_grace_seconds: alertGrace.grace_seconds,
+          alert_waited_ms: alertGrace.waited_ms,
           raw_event_count: rawCount,
           alert_count: alertCount,
+          attributable_rule_names: alertSummary.rule_names,
           behavior_success: execution?.behavior_success ?? false,
           outcome,
           raw_indices: rawQuery.indices,
@@ -166,16 +178,15 @@ export function registerAtomicElasticTool(
           outcome,
           raw_event_count: rawCount,
           alert_count: alertCount,
+          attributable_rule_names: alertSummary.rule_names,
           detector: "elastic",
           evidence: evidencePath,
-          reason:
-            outcome === "not_applicable"
-              ? "Telemetry counts are contextual only because digest-approved behavior success criteria did not pass"
-              : outcome === "detected"
-              ? "Raw telemetry and at least one matching alert were observed"
-              : outcome === "missed"
-                ? "Raw telemetry was observed but no matching alert was found"
-                : "No matching raw telemetry was found in the bounded window",
+          reason: coverageReason(
+            outcome,
+            rawCount,
+            alertCount,
+            alertGrace.grace_seconds
+          ),
         });
         return textResult({
           ok: true,
@@ -183,6 +194,10 @@ export function registerAtomicElasticTool(
           outcome,
           raw_event_count: rawCount,
           alert_count: alertCount,
+          attributable_rule_names: alertSummary.rule_names,
+          effective_end: effectiveEnd,
+          alert_grace_seconds: alertGrace.grace_seconds,
+          alert_waited_ms: alertGrace.waited_ms,
           evidence_path: evidencePath,
           run: snapshot,
         });
@@ -191,6 +206,63 @@ export function registerAtomicElasticTool(
       }
     }
   );
+}
+
+export async function waitForAlertGracePeriod(
+  executionEndedAt: string | undefined,
+  options: {
+    readonly now?: () => number;
+    readonly sleep?: (milliseconds: number) => Promise<void>;
+    readonly env?: Readonly<Record<string, string | undefined>>;
+  } = {}
+): Promise<{ readonly grace_seconds: number; readonly waited_ms: number }> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((milliseconds: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const graceSeconds = alertGraceSeconds(options.env ?? process.env);
+  if (!executionEndedAt) return { grace_seconds: graceSeconds, waited_ms: 0 };
+  const endedAt = Date.parse(executionEndedAt);
+  if (!Number.isFinite(endedAt)) {
+    throw new Error("Execution end time is invalid; refusing delayed alert verification");
+  }
+  const remaining = Math.max(0, endedAt + graceSeconds * 1_000 - now());
+  if (remaining > 0) await sleep(remaining);
+  return { grace_seconds: graceSeconds, waited_ms: remaining };
+}
+
+function alertGraceSeconds(env: Readonly<Record<string, string | undefined>>): number {
+  const configured = env.MACOS_ATOMIC_ALERT_GRACE_SECONDS?.trim();
+  if (!configured) return DEFAULT_ALERT_GRACE_SECONDS;
+  if (!/^\d+$/.test(configured)) {
+    throw new Error("MACOS_ATOMIC_ALERT_GRACE_SECONDS must be an integer from 0 to 900");
+  }
+  const seconds = Number(configured);
+  if (seconds > MAX_ALERT_GRACE_SECONDS) {
+    throw new Error("MACOS_ATOMIC_ALERT_GRACE_SECONDS must be an integer from 0 to 900");
+  }
+  return seconds;
+}
+
+function laterTimestamp(first: string, second: string): string {
+  return Date.parse(first) >= Date.parse(second) ? first : second;
+}
+
+function coverageReason(
+  outcome: AtomicCoverageRecord["outcome"],
+  rawCount: number,
+  alertCount: number,
+  graceSeconds: number
+): string {
+  if (outcome === "not_applicable") {
+    return `Behavior success was not confirmed; ${rawCount} raw event(s) and ${alertCount} alert(s) are contextual only after a ${graceSeconds}-second grace period`;
+  }
+  if (outcome === "detected") {
+    return `Behavior succeeded; ${rawCount} matching raw event(s) and ${alertCount} attributable alert(s) were observed after a ${graceSeconds}-second grace period`;
+  }
+  if (outcome === "missed") {
+    return `Behavior succeeded; ${rawCount} matching raw event(s) were observed, but no attributable alert was found after a ${graceSeconds}-second grace period`;
+  }
+  return `Behavior succeeded; no matching raw telemetry or attributable alert was found after a ${graceSeconds}-second grace period`;
 }
 
 async function elasticCount(
@@ -236,6 +308,98 @@ async function elasticCount(
   const body = (await response.json()) as { count?: unknown };
   if (typeof body.count !== "number") throw new Error("Elastic response has no numeric count");
   return body.count;
+}
+
+type AttributableAlertSummary = {
+  readonly count: number;
+  readonly rule_names: readonly string[];
+};
+
+export function parseAttributableAlertSummary(body: unknown): AttributableAlertSummary {
+  if (!body || typeof body !== "object") {
+    throw new Error("Elastic alert response is not an object");
+  }
+  const response = body as {
+    hits?: { total?: number | { value?: unknown; relation?: unknown } };
+    aggregations?: { attributable_rule_names?: { buckets?: unknown } };
+  };
+  const total = response.hits?.total;
+  const count = typeof total === "number"
+    ? total
+    : typeof total?.value === "number" && total.relation === "eq"
+      ? total.value
+      : undefined;
+  if (count === undefined) {
+    throw new Error("Elastic alert response has no exact numeric hit count");
+  }
+  const buckets = response.aggregations?.attributable_rule_names?.buckets;
+  if (!Array.isArray(buckets)) {
+    throw new Error("Elastic alert response has no rule-name aggregation");
+  }
+  const ruleNames = [...new Set(
+    buckets.flatMap((bucket) => {
+      if (!bucket || typeof bucket !== "object") return [];
+      const key = (bucket as { key?: unknown }).key;
+      return typeof key === "string" && key.length > 0 ? [key] : [];
+    })
+  )].sort();
+  return { count, rule_names: ruleNames };
+}
+
+async function elasticAlertSummary(
+  plan: AtomicQueryPlan,
+  start: string,
+  end: string,
+  timestampField: string,
+  approvedBase?: string
+): Promise<AttributableAlertSummary> {
+  const base = approvedBase ?? process.env.ELASTICSEARCH_URL;
+  const apiKey = getElasticEnvironment().apiKey;
+  if (!base || !apiKey) {
+    throw new Error(
+      "The approved plan needs an Elasticsearch output URL and ELASTIC_API_KEY is required"
+    );
+  }
+  assertAllowedIndices(plan.indices);
+  const root = base.endsWith("/") ? base : `${base}/`;
+  const indices = plan.indices.join(",");
+  const url = new URL(`${indices}/_search`, root);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `ApiKey ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      size: 0,
+      track_total_hits: true,
+      query: {
+        bool: {
+          filter: [
+            plan.query,
+            { range: { [timestampField]: { gte: start, lte: end } } },
+          ],
+        },
+      },
+      aggregations: {
+        attributable_rule_names: {
+          terms: {
+            field: "kibana.alert.rule.name",
+            size: 1_000,
+            order: { _key: "asc" },
+          },
+        },
+      },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    const responseBody = (await response.text()).slice(0, 2_000);
+    throw new Error(
+      `Elastic attributable-alert search failed (${response.status}): ${responseBody}`
+    );
+  }
+  return parseAttributableAlertSummary(await response.json());
 }
 
 function assertAllowedIndices(indices: readonly string[]): void {

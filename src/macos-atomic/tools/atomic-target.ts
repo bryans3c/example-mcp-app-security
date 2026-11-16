@@ -10,11 +10,16 @@ import { z } from "zod";
 import {
   getElasticAgentStatus,
   getElasticEndpointReadiness,
+  inspectElasticTemplateResidue,
   installAndVerifyElasticAgent,
   isElasticAgentHealthy,
+  MACOS_TEST_BINARY,
+  sanitizeElasticAgentForTemplate,
+  verifyElasticTemplateIdentityAbsent,
 } from "../execution/elastic-agent.js";
 import {
   createEphemeralEnrollmentToken,
+  getElasticEnvironment,
   revokeEnrollmentToken,
   validateApprovedElasticConfiguration,
 } from "../execution/elastic-fleet.js";
@@ -30,6 +35,10 @@ import {
 import { runProcess } from "../execution/process.js";
 import {
   cloneAndStartTartTarget,
+  coldBootTartTarget,
+  deleteLocalTartImageArchive,
+  sealLocalTartTarget,
+  startExistingTartTarget,
   stopAndDeleteTartTarget,
   tartTargetExists,
 } from "../execution/tart.js";
@@ -49,6 +58,8 @@ const targetSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("instrumentation_status"), run_id: z.string().min(1) }),
   z.object({ action: z.literal("register"), run_id: z.string().min(1) }),
   z.object({ action: z.literal("provision"), run_id: z.string().min(1) }),
+  z.object({ action: z.literal("prepare_template"), run_id: z.string().min(1) }),
+  z.object({ action: z.literal("promote_template"), run_id: z.string().min(1) }),
   z.object({ action: z.literal("destroy"), run_id: z.string().min(1) }),
 ]);
 
@@ -59,6 +70,8 @@ const targetToolSchema = z.object({
     "instrumentation_status",
     "register",
     "provision",
+    "prepare_template",
+    "promote_template",
     "destroy",
   ]),
   run_id: z.string().min(1).optional(),
@@ -100,6 +113,243 @@ export function pinnedRepositoryRevisionArgs(repositoryPath: string): string[] {
   return ["sudo", "git", "-C", repositoryPath, "rev-parse", "HEAD"];
 }
 
+type ElasticAgentPlan = NonNullable<AtomicPlan["instrumentation"]>["elastic_agent"];
+type AwsRuntimeCredentialPlan = NonNullable<
+  NonNullable<AtomicPlan["runtime_credentials"]>["aws"]
+>;
+
+type AwsCredentialProcessDocument = {
+  readonly Version?: unknown;
+  readonly AccessKeyId?: unknown;
+  readonly SecretAccessKey?: unknown;
+  readonly SessionToken?: unknown;
+  readonly Expiration?: unknown;
+};
+
+export type StagedAwsRuntimeCredentials = {
+  readonly ok: true;
+  readonly provider: "aws";
+  readonly source_profile: string;
+  readonly target_profile: string;
+  readonly temporary: boolean;
+  readonly expiration?: string;
+};
+
+export async function stageApprovedAwsRuntimeCredentials(
+  scope: AtomicPlan["scope"],
+  credentialPlan: AwsRuntimeCredentialPlan,
+  options: {
+    readonly runHostProcess?: typeof runProcess;
+    readonly runTarget?: typeof runOnTarget;
+  } = {}
+): Promise<StagedAwsRuntimeCredentials> {
+  if (scope.target_kind !== "tart" || scope.lifecycle !== "ephemeral") {
+    throw new Error("AWS runtime credentials require a fresh ephemeral Tart target");
+  }
+  const runHostProcess = options.runHostProcess ?? runProcess;
+  const runTarget = options.runTarget ?? runOnTarget;
+  const exported = await runHostProcess(
+    "aws",
+    [
+      "configure",
+      "export-credentials",
+      "--profile",
+      credentialPlan.source_profile,
+      "--format",
+      "process",
+    ],
+    { timeoutMs: 30_000, maxOutputBytes: 64_000 }
+  );
+  if (
+    exported.exitCode !== 0 ||
+    exported.timedOut ||
+    exported.truncated
+  ) {
+    throw new Error(
+      `AWS credential export failed for approved profile ${credentialPlan.source_profile}`
+    );
+  }
+  let document: AwsCredentialProcessDocument;
+  try {
+    document = JSON.parse(exported.stdout) as AwsCredentialProcessDocument;
+  } catch {
+    throw new Error(
+      `AWS credential export returned invalid JSON for approved profile ${credentialPlan.source_profile}`
+    );
+  }
+  const accessKeyId = requiredAwsCredentialValue(document.AccessKeyId, "access key id");
+  const secretAccessKey = requiredAwsCredentialValue(
+    document.SecretAccessKey,
+    "secret access key"
+  );
+  const sessionToken = optionalAwsCredentialValue(document.SessionToken, "session token");
+  const expiration = optionalAwsCredentialValue(document.Expiration, "expiration");
+  const credentials = [
+    `[${credentialPlan.target_profile}]`,
+    `aws_access_key_id = ${accessKeyId}`,
+    `aws_secret_access_key = ${secretAccessKey}`,
+    ...(sessionToken ? [`aws_session_token = ${sessionToken}`] : []),
+    "",
+  ].join("\n");
+  const staged = await runTarget(
+    scope,
+    [
+      "/bin/sh",
+      "-c",
+      'set -eu; umask 077; mkdir -p "$HOME/.aws"; cat > "$HOME/.aws/credentials"; chmod 600 "$HOME/.aws/credentials"',
+    ],
+    30_000,
+    { input: credentials }
+  );
+  if (staged.exitCode !== 0 || staged.timedOut || staged.truncated) {
+    throw new Error("AWS runtime credential staging failed on the disposable target");
+  }
+  return {
+    ok: true,
+    provider: "aws",
+    source_profile: credentialPlan.source_profile,
+    target_profile: credentialPlan.target_profile,
+    temporary: sessionToken !== undefined,
+    ...(expiration ? { expiration } : {}),
+  };
+}
+
+function requiredAwsCredentialValue(value: unknown, label: string): string {
+  const normalized = optionalAwsCredentialValue(value, label);
+  if (!normalized) throw new Error(`AWS credential export omitted ${label}`);
+  return normalized;
+}
+
+function optionalAwsCredentialValue(value: unknown, label: string): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || /[\r\n\0]/.test(value) || value.length > 16_384) {
+    throw new Error(`AWS credential export returned an invalid ${label}`);
+  }
+  return value;
+}
+
+export type ElasticProcessTelemetryReadiness = {
+  readonly ok: true;
+  readonly host_name: string;
+  readonly marker: string;
+  readonly attempts: number;
+  readonly waited_ms: number;
+  readonly event_count: number;
+};
+
+export async function waitForElasticProcessTelemetry(
+  scope: AtomicPlan["scope"],
+  elastic: ElasticAgentPlan,
+  runId: string,
+  options: {
+    readonly runTarget?: typeof runOnTarget;
+    readonly fetchImpl?: typeof fetch;
+    readonly sleep?: (milliseconds: number) => Promise<void>;
+    readonly now?: () => number;
+    readonly timeoutMs?: number;
+    readonly pollMs?: number;
+    readonly environment?: { readonly kibanaUrl: string; readonly apiKey: string };
+  } = {}
+): Promise<ElasticProcessTelemetryReadiness> {
+  const runTarget = options.runTarget ?? runOnTarget;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const sleep = options.sleep ?? ((milliseconds: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const now = options.now ?? Date.now;
+  const timeoutMs = options.timeoutMs ?? 180_000;
+  const pollMs = options.pollMs ?? 5_000;
+  const environment = options.environment ?? getElasticEnvironment();
+  const normalizedKibana = environment.kibanaUrl.replace(/\/$/, "");
+  if (normalizedKibana !== elastic.kibana_url.replace(/\/$/, "")) {
+    throw new Error("Telemetry readiness refuses a configured Kibana URL outside the approved stack");
+  }
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 600_000) {
+    throw new Error("Telemetry readiness timeout must be an integer from 1000 to 600000 milliseconds");
+  }
+  if (!Number.isInteger(pollMs) || pollMs < 250 || pollMs > 30_000) {
+    throw new Error("Telemetry readiness poll interval must be an integer from 250 to 30000 milliseconds");
+  }
+
+  const hostnameResult = await runTarget(
+    scope,
+    ["/usr/sbin/scutil", "--get", "HostName"],
+    30_000
+  );
+  const hostName = hostnameResult.stdout.trim();
+  if (
+    hostnameResult.exitCode !== 0 ||
+    hostnameResult.timedOut ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/.test(hostName)
+  ) {
+    throw new Error("Telemetry readiness could not resolve the target HostName");
+  }
+  const marker =
+    "macos-atomic-ready-" + runId.replace(/[^a-z0-9-]/gi, "-").slice(-48);
+  const startedAt = now();
+  let attempts = 0;
+  let eventCount = 0;
+  while (now() - startedAt <= timeoutMs) {
+    attempts += 1;
+    const emitted = await runTarget(scope, ["/bin/echo", marker], 30_000);
+    if (emitted.exitCode !== 0 || emitted.timedOut) {
+      throw new Error("Telemetry readiness marker process failed on the target");
+    }
+    await sleep(pollMs);
+    const url = new URL(
+      "logs-endpoint.events.process-*/_count",
+      elastic.elasticsearch_url.replace(/\/$/, "") + "/"
+    );
+    const response = await fetchImpl(url, {
+      method: "POST",
+      headers: {
+        authorization: "ApiKey " + environment.apiKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        query: {
+          bool: {
+            filter: [
+              { term: { "host.os.type": "macos" } },
+              { term: { "host.name": hostName } },
+              { term: { "event.category": "process" } },
+              { term: { "event.action": "exec" } },
+              { wildcard: { "process.command_line": { value: "*" + marker + "*" } } },
+              { range: { "@timestamp": { gte: "now-10m", lte: "now+1m" } } },
+            ],
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) {
+      const body = (await response.text()).slice(0, 2_000);
+      throw new Error(
+        "Elastic process-telemetry readiness query failed (" +
+          response.status + "): " + body
+      );
+    }
+    const body = await response.json() as { count?: unknown };
+    if (typeof body.count !== "number") {
+      throw new Error("Elastic process-telemetry readiness response has no numeric count");
+    }
+    eventCount = body.count;
+    if (eventCount > 0) {
+      return {
+        ok: true,
+        host_name: hostName,
+        marker,
+        attempts,
+        waited_ms: now() - startedAt,
+        event_count: eventCount,
+      };
+    }
+  }
+  throw new Error(
+    "Elastic Endpoint process telemetry was not observable for " + hostName +
+      " after " + timeoutMs + " ms"
+  );
+}
+
 export function registerMacosAtomicTargetTool(
   server: McpServer,
   store: AtomicRunStore = createAtomicRunStore()
@@ -109,7 +359,7 @@ export function registerMacosAtomicTargetTool(
     {
       title: "macOS Atomic Target",
       description:
-        "Provision, register, verify, instrument, or destroy only the digest-approved macOS Tart/SSH target. Tart images must be OCI digest pinned. Elastic enrollment reuses the app default cluster credentials and requires a base image or MDM profile with the macOS Endpoint Security, network-filter, and Full Disk Access approvals.",
+        "Provision, register, verify, instrument, prepare and promote a no-MDM local Tart template, or destroy only the digest-approved macOS Tart/SSH target. Tart images must be OCI digest pinned or local .tvm archives bound by SHA-256. Elastic enrollment reuses the app default cluster credentials and requires MDM approval or a manually approved seed whose sanitized fresh clone passes every Endpoint readiness check.",
       inputSchema: targetToolSchema,
       annotations: { destructiveHint: true },
     },
@@ -131,14 +381,273 @@ export function registerMacosAtomicTargetTool(
           }
           const status = await getElasticAgentStatus(plan.scope);
           const endpointReadiness = await getElasticEndpointReadiness(plan.scope, status);
+          const templateResidue = endpointReadiness.ok
+            ? undefined
+            : await inspectElasticTemplateResidue(plan.scope);
           return textResult(
-            { ok: endpointReadiness.ok, status, endpoint_readiness: endpointReadiness },
+            {
+              ok: endpointReadiness.ok,
+              status,
+              endpoint_readiness: endpointReadiness,
+              template_residue: templateResidue,
+            },
             !endpointReadiness.ok
           );
         }
         if (parsed.action === "register") {
           store.assertPhase(parsed.run_id, ["provisioning"]);
           return textResult(await registerTarget(store, parsed.run_id, plan));
+        }
+        if (parsed.action === "prepare_template") {
+          store.assertPhase(parsed.run_id, ["provisioning"]);
+          assertNoMdmTemplateControls(plan);
+          const targetResource = loaded.resources.find(
+            (resource) =>
+              resource.id === plan.scope.target_id &&
+              resource.kind === "target" &&
+              !resource.cleaned
+          );
+          if (!targetResource) {
+            return textResult(
+              { error: "Register the manually approved Tart seed before preparing a template" },
+              true
+            );
+          }
+          if (!plan.instrumentation?.elastic_agent) {
+            return textResult({ error: "Template preparation requires Elastic instrumentation" }, true);
+          }
+          const initialStatus = await getElasticAgentStatus(plan.scope);
+          const initialReadiness = await getElasticEndpointReadiness(
+            plan.scope,
+            initialStatus
+          );
+          if (!initialReadiness.ok) {
+            return textResult(
+              { error: "The manually approved seed is not Endpoint-ready", initial_readiness: initialReadiness },
+              true
+            );
+          }
+          const sanitization = await sanitizeElasticAgentForTemplate(plan.scope);
+          if (!sanitization.ok) {
+            return textResult(
+              { error: "Elastic identity sanitization failed", sanitization },
+              true
+            );
+          }
+          const persistenceBoot = await coldBootTartTarget(plan.scope);
+          let persistentAbsence = await verifyElasticTemplateIdentityAbsent(plan.scope);
+          let retrySanitization: Awaited<ReturnType<typeof sanitizeElasticAgentForTemplate>> | undefined;
+          let retryPersistenceBoot: Awaited<ReturnType<typeof coldBootTartTarget>> | undefined;
+          if (!persistentAbsence.ok && !persistentAbsence.agent_path_absent) {
+            retrySanitization = await sanitizeElasticAgentForTemplate(plan.scope);
+            if (retrySanitization.ok) {
+              retryPersistenceBoot = await coldBootTartTarget(plan.scope);
+              persistentAbsence = await verifyElasticTemplateIdentityAbsent(plan.scope);
+            }
+          }
+          if (!persistentAbsence.ok) {
+            return textResult(
+              {
+                error: "Elastic identity returned after a cold boot; refusing final archive promotion",
+                persistence_boot: persistenceBoot,
+                persistent_absence: persistentAbsence,
+                retry_sanitization: retrySanitization,
+                retry_persistence_boot: retryPersistenceBoot,
+              },
+              true
+            );
+          }
+          const sealed = await sealLocalTartTarget(
+            plan.scope,
+            `${parsed.run_id}-candidate`,
+            plan.controls.ttl_minutes
+          );
+          store.recordResource(parsed.run_id, {
+            id: sealed.archivePath,
+            kind: "tart-template-candidate",
+            origin: "provisioned",
+            cleaned: false,
+            notes: `Candidate pending behavior, telemetry, and final sanitization: ${sealed.reference}`,
+          });
+          const removedSeed = await stopAndDeleteTartTarget(plan.scope.target_id);
+          const seedAbsent = !(await tartTargetExists(plan.scope.target_id));
+          if (!seedAbsent || removedSeed.deleted.exitCode !== 0) {
+            return textResult(
+              { error: "Could not replace the sanitized seed with a fresh import", removed_seed: removedSeed },
+              true
+            );
+          }
+          store.recordResource(parsed.run_id, { ...targetResource, cleaned: true });
+          const preparedPlan: AtomicPlan = {
+            ...plan,
+            scope: { ...plan.scope, target_image: sealed.reference },
+          };
+          let launched: Awaited<ReturnType<typeof cloneAndStartTartTarget>>;
+          try {
+            launched = await cloneAndStartTartTarget(
+              preparedPlan.scope,
+              preparedPlan.controls.ttl_minutes
+            );
+          } catch (error) {
+            store.recordResource(parsed.run_id, {
+              id: plan.scope.target_id,
+              kind: "target",
+              origin: "orphaned",
+              cleaned: false,
+              notes: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
+          store.recordResource(parsed.run_id, {
+            id: plan.scope.target_id,
+            kind: "target",
+            origin: "orphaned",
+            cleaned: false,
+            notes: "Fresh import awaiting Elastic readiness validation",
+          });
+          const registered = await registerTarget(store, parsed.run_id, preparedPlan);
+          return textResult({
+            ok: true,
+            candidate_image: {
+              reference: sealed.reference,
+              archive_path: sealed.archivePath,
+              sha256: sealed.sha256,
+            },
+            promotion_required: true,
+            sanitization,
+            persistence_boot: persistenceBoot,
+            persistent_absence: persistentAbsence,
+            retry_sanitization: retrySanitization,
+            retry_persistence_boot: retryPersistenceBoot,
+            initial_readiness: initialReadiness,
+            removed_seed: removedSeed,
+            fresh_import: launched,
+            registered,
+          });
+        }
+        if (parsed.action === "promote_template") {
+          store.assertPhase(parsed.run_id, ["cleaning"]);
+          assertNoMdmTemplateControls(plan);
+          const current = store.getLoaded(parsed.run_id);
+          assertNoMdmTemplatePromotionReady(current);
+          const candidate = current.resources.find(
+            (resource) => resource.kind === "tart-template-candidate" && !resource.cleaned
+          );
+          const targetResource = current.resources.find(
+            (resource) =>
+              resource.id === plan.scope.target_id &&
+              resource.kind === "target" &&
+              !resource.cleaned
+          );
+          if (!candidate || !targetResource) {
+            return textResult(
+              { error: "Template promotion requires the validated candidate and target" },
+              true
+            );
+          }
+          await startExistingTartTarget(plan.scope);
+          const status = await getElasticAgentStatus(plan.scope);
+          const readiness = await getElasticEndpointReadiness(plan.scope, status);
+          const preSanitizationAbsence = await verifyElasticTemplateIdentityAbsent(plan.scope);
+          const sanitization = preSanitizationAbsence.ok
+            ? {
+                ok: true,
+                uninstall: {
+                  exitCode: 0,
+                  timedOut: false,
+                  stdout: "Already sanitized after an earlier promotion attempt",
+                  stderr: "",
+                },
+                cleanup: { exitCode: 0, timedOut: false, stdout: "", stderr: "" },
+                agent_path_absent: true,
+                endpoint_path_absent: true,
+                agent_link_absent: true,
+                elastic_processes_absent: true,
+              }
+            : await sanitizeElasticAgentForTemplate(plan.scope);
+          if (!sanitization.ok) {
+            return textResult(
+              { error: "Final Elastic identity sanitization failed", sanitization },
+              true
+            );
+          }
+          const persistenceBoot = await coldBootTartTarget(plan.scope);
+          let persistentAbsence = await verifyElasticTemplateIdentityAbsent(plan.scope);
+          let retrySanitization: Awaited<ReturnType<typeof sanitizeElasticAgentForTemplate>> | undefined;
+          let retryPersistenceBoot: Awaited<ReturnType<typeof coldBootTartTarget>> | undefined;
+          if (!persistentAbsence.ok && !persistentAbsence.agent_path_absent) {
+            retrySanitization = await sanitizeElasticAgentForTemplate(plan.scope);
+            if (retrySanitization.ok) {
+              retryPersistenceBoot = await coldBootTartTarget(plan.scope);
+              persistentAbsence = await verifyElasticTemplateIdentityAbsent(plan.scope);
+            }
+          }
+          if (!persistentAbsence.ok) {
+            return textResult(
+              {
+                error: "Elastic identity returned after a cold boot; refusing final archive promotion",
+                persistence_boot: persistenceBoot,
+                persistent_absence: persistentAbsence,
+                retry_sanitization: retrySanitization,
+                retry_persistence_boot: retryPersistenceBoot,
+              },
+              true
+            );
+          }
+          const sealed = await sealLocalTartTarget(
+            plan.scope,
+            parsed.run_id,
+            plan.controls.ttl_minutes
+          );
+          store.recordResource(parsed.run_id, {
+            id: sealed.archivePath,
+            kind: "tart-template-archive",
+            origin: "provisioned",
+            cleaned: false,
+            notes: `Final sanitized archive pending target and candidate cleanup: ${sealed.reference}`,
+          });
+          deleteLocalTartImageArchive(candidate.id);
+          store.recordResource(parsed.run_id, { ...candidate, cleaned: true });
+          const removedTarget = await stopAndDeleteTartTarget(plan.scope.target_id);
+          const targetAbsent = !(await tartTargetExists(plan.scope.target_id));
+          if (!targetAbsent || removedTarget.deleted.exitCode !== 0) {
+            return textResult(
+              { error: "Could not remove the validation target after final sealing", removed_target: removedTarget },
+              true
+            );
+          }
+          store.recordResource(parsed.run_id, { ...targetResource, cleaned: true });
+          const finalArchive = store
+            .getLoaded(parsed.run_id)
+            .resources.find(
+              (resource) =>
+                resource.id === sealed.archivePath &&
+                resource.kind === "tart-template-archive"
+            );
+          if (!finalArchive) throw new Error("Final template archive ledger entry is missing");
+          store.recordResource(parsed.run_id, {
+            ...finalArchive,
+            cleaned: true,
+            notes: `Promoted immutable campaign input after behavior, telemetry, and fresh-clone validation: ${sealed.reference}`,
+          });
+          return textResult({
+            ok: true,
+            prepared_image: {
+              reference: sealed.reference,
+              archive_path: sealed.archivePath,
+              sha256: sealed.sha256,
+            },
+            readiness,
+            pre_sanitization_absence: preSanitizationAbsence,
+            sanitization,
+            persistence_boot: persistenceBoot,
+            persistent_absence: persistentAbsence,
+            retry_sanitization: retrySanitization,
+            retry_persistence_boot: retryPersistenceBoot,
+            removed_candidate: candidate.id,
+            removed_target: removedTarget,
+            target_absent: targetAbsent,
+          });
         }
         if (parsed.action === "provision") {
           store.assertPhase(parsed.run_id, ["provisioning"]);
@@ -213,6 +722,21 @@ export function registerMacosAtomicTargetTool(
           }
           const setup = await runSetupSteps(plan.scope, plan.setup_steps ?? []);
           if (!setup.ok) return textResult({ ok: false, tart: launched, setup }, true);
+          const runtimeCredentials = plan.runtime_credentials?.aws
+            ? await stageApprovedAwsRuntimeCredentials(
+                plan.scope,
+                plan.runtime_credentials.aws
+              )
+            : undefined;
+          if (runtimeCredentials) {
+            store.recordResource(parsed.run_id, {
+              id: `runtime-credential:aws:${runtimeCredentials.target_profile}`,
+              kind: "runtime-credential",
+              origin: "provisioned",
+              cleaned: false,
+              notes: `Ephemeral AWS credential material from approved host profile ${runtimeCredentials.source_profile}`,
+            });
+          }
           const runnerBootstrap = await runOnTarget(
             plan.scope,
             ["sudo", "/bin/sh", "-s"],
@@ -232,6 +756,7 @@ export function registerMacosAtomicTargetTool(
             bootstrap,
             packages,
             setup,
+            runtime_credentials: runtimeCredentials,
             runner_bootstrap: runnerBootstrap,
           });
         }
@@ -253,15 +778,36 @@ export function registerMacosAtomicTargetTool(
             store.recordResource(parsed.run_id, { ...resource, cleaned: true });
           }
         }
-        const destroyed = await stopAndDeleteTartTarget(plan.scope.target_id);
+        const targetExisted = await tartTargetExists(plan.scope.target_id);
+        const destroyed = targetExisted
+          ? await stopAndDeleteTartTarget(plan.scope.target_id)
+          : undefined;
         const absent = !(await tartTargetExists(plan.scope.target_id));
-        if (!absent || destroyed.deleted.exitCode !== 0) {
+        if (!absent || (destroyed && destroyed.deleted.exitCode !== 0)) {
           return textResult({ ok: false, destroyed, absent }, true);
         }
         const refreshed = store.getLoaded(parsed.run_id);
         for (const resource of refreshed.resources) {
           if (resource.id === plan.scope.target_id && resource.kind === "target") {
             store.recordResource(parsed.run_id, { ...resource, cleaned: true });
+          }
+          if (resource.kind === "runtime-credential" && !resource.cleaned) {
+            store.recordResource(parsed.run_id, {
+              ...resource,
+              cleaned: true,
+              notes: `${resource.notes ?? "Runtime credential material"}; removed with disposable target`,
+            });
+          }
+          if (
+            ["tart-template-archive", "tart-template-candidate"].includes(resource.kind) &&
+            !resource.cleaned
+          ) {
+            deleteLocalTartImageArchive(resource.id);
+            store.recordResource(parsed.run_id, {
+              ...resource,
+              cleaned: true,
+              notes: "Removed template archive after failed or incomplete validation",
+            });
           }
         }
         return textResult({ ok: true, destroyed, target_absent: absent });
@@ -275,11 +821,64 @@ export function registerMacosAtomicTargetTool(
   );
 }
 
+export function assertNoMdmTemplateControls(plan: AtomicPlan): void {
+  if (plan.scope.target_kind !== "tart" || plan.scope.lifecycle !== "ephemeral") {
+    throw new Error("No-MDM template preparation requires an ephemeral Tart target");
+  }
+  if (plan.scope.target_profile !== "desktop") {
+    throw new Error("No-MDM template preparation requires a manually approved desktop target");
+  }
+  if (
+    !plan.controls.snapshot_before ||
+    !plan.controls.allow_destructive ||
+    !plan.controls.allow_reboot ||
+    !plan.controls.allow_tcc_changes
+  ) {
+    throw new Error(
+      "No-MDM template preparation requires snapshot_before, allow_destructive, allow_reboot, and allow_tcc_changes"
+    );
+  }
+}
+
+export function assertNoMdmTemplatePromotionReady(
+  loaded: ReturnType<AtomicRunStore["getLoaded"]>
+): void {
+  if (!loaded.plan) throw new Error("Template promotion requires an exact plan");
+  if (loaded.state.phase !== "cleaning") {
+    throw new Error("Template promotion is allowed only during cleaning");
+  }
+  for (const test of loaded.plan.tests) {
+    const behavior = loaded.executions.find(
+      (execution) =>
+        execution.test_guid === test.test_guid &&
+        ["execute", "manual"].includes(execution.stage) &&
+        execution.status === "passed" &&
+        execution.behavior_success === true
+    );
+    if (!behavior) {
+      throw new Error(`Template validation behavior is not proven for ${test.test_guid}`);
+    }
+    const coverage = loaded.coverage.find(
+      (record) =>
+        record.test_guid === test.test_guid &&
+        ["detected", "missed"].includes(record.outcome) &&
+        (record.raw_event_count ?? 0) > 0
+    );
+    if (!coverage) {
+      throw new Error(`Template validation telemetry is not proven for ${test.test_guid}`);
+    }
+  }
+}
+
 async function registerTarget(
   store: AtomicRunStore,
   runId: string,
   plan: AtomicPlan
 ): Promise<Record<string, unknown>> {
+  const startup =
+    plan.scope.target_kind === "tart" && plan.scope.lifecycle === "ephemeral"
+      ? await startExistingTartTarget(plan.scope)
+      : undefined;
   const [user, version, architecture] = await Promise.all([
     runOnTarget(plan.scope, ["id", "-u", plan.scope.execution_user], 30_000),
     runOnTarget(plan.scope, ["sw_vers", "-productVersion"], 30_000),
@@ -335,10 +934,34 @@ async function registerTarget(
   if (!stagedSourceAssets.ok) throw new Error("Approved operator assets could not be staged");
 
   let instrumentation: unknown;
+  let instrumentationRecovery: unknown;
   if (plan.instrumentation?.elastic_agent) {
     await validateApprovedElasticConfiguration(plan.instrumentation.elastic_agent);
     let status = await getElasticAgentStatus(plan.scope);
     if (!isElasticAgentHealthy(status)) {
+      const installedAgentChecks = await Promise.all([
+        runOnTarget(
+          plan.scope,
+          [MACOS_TEST_BINARY, "-e", "/Library/Elastic/Agent"],
+          30_000
+        ),
+        runOnTarget(
+          plan.scope,
+          [MACOS_TEST_BINARY, "-e", "/usr/local/bin/elastic-agent"],
+          30_000
+        ),
+      ]);
+      if (
+        installedAgentChecks.some(
+          (result) => result.exitCode === 0 && !result.timedOut
+        )
+      ) {
+        assertNoMdmTemplateControls(plan);
+        instrumentationRecovery = await sanitizeElasticAgentForTemplate(plan.scope);
+        if (!(instrumentationRecovery as { ok?: boolean }).ok) {
+          throw new Error("Could not sanitize the stale Elastic Agent before re-enrollment");
+        }
+      }
       const enrollment = await createEphemeralEnrollmentToken(
         plan.instrumentation.elastic_agent,
         runId
@@ -367,8 +990,19 @@ async function registerTarget(
         });
       }
       if (!(instrumentation as { ok?: boolean }).ok) {
+        const failed = instrumentation as {
+          installation?: Record<string, unknown>;
+          endpoint_readiness?: unknown;
+        };
+        const installation = failed.installation ?? {};
         throw new Error(
-          "Elastic Agent did not become healthy; verify the base image or MDM profile grants Endpoint Security, network-filter, and Full Disk Access approvals"
+          `Elastic Agent did not become healthy: ${JSON.stringify({
+            error: installation.error,
+            install_exit_code: installation.install_exit_code,
+            process_exit_code: installation.process_exit_code,
+            process_stderr: installation.process_stderr,
+            endpoint_readiness: failed.endpoint_readiness,
+          })}`
         );
       }
       status = await getElasticAgentStatus(plan.scope);
@@ -380,7 +1014,18 @@ async function registerTarget(
         "Elastic Endpoint is not telemetry-ready; require an active and enabled co.elastic.systemextension plus successful Full Disk Access and network-filter install checks"
       );
     }
-    instrumentation = instrumentation ?? { status, endpoint_readiness: endpointReadiness };
+    const processTelemetryReadiness = await waitForElasticProcessTelemetry(
+      plan.scope,
+      plan.instrumentation.elastic_agent,
+      runId
+    );
+    instrumentation = {
+      ...((instrumentation as Record<string, unknown> | undefined) ?? {
+        status,
+        endpoint_readiness: endpointReadiness,
+      }),
+      process_telemetry_readiness: processTelemetryReadiness,
+    };
   }
 
   const snapshot = store.recordResource(runId, {
@@ -402,6 +1047,8 @@ async function registerTarget(
     packages,
     capabilities,
     instrumentation,
+    instrumentation_recovery: instrumentationRecovery,
+    startup,
     run: snapshot,
   };
 }
